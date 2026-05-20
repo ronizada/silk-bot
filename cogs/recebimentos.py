@@ -1,7 +1,11 @@
-import sqlite3
+import database as sqlite3
+import os
+import psycopg
+from dotenv import load_dotenv
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional
+from uuid import uuid4
 
 import aiohttp
 import discord
@@ -13,6 +17,20 @@ from utils.embeds import create_embed
 
 VENDAS_DB_PATH = Path("data/vendas.db")
 RECEBIMENTOS_DB_PATH = Path("data/recebimentos.db")
+
+load_dotenv(dotenv_path=".env")
+
+
+def get_pg_conn():
+    database_url = os.getenv("DATABASE_URL")
+
+    if not database_url:
+        raise RuntimeError("DATABASE_URL não encontrada no .env.")
+
+    if database_url.startswith("DATABASE_URL="):
+        database_url = database_url.split("=", 1)[1]
+
+    return psycopg.connect(database_url)
 
 
 def now_iso() -> str:
@@ -118,41 +136,130 @@ def get_config(guild_id: int):
 
 
 def venda_ja_enviada(venda_id: int) -> bool:
-    with get_conn(RECEBIMENTOS_DB_PATH) as conn:
-        row = conn.execute("""
-            SELECT venda_id
-            FROM recebimento_enviados
-            WHERE venda_id = ?
-            LIMIT 1
-        """, (venda_id,)).fetchone()
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT venda_id
+                FROM recebimento_enviados
+                WHERE venda_id = %s
+                LIMIT 1
+            """, (venda_id,))
 
-        return row is not None
+            return cur.fetchone() is not None
 
 
 def marcar_venda_enviada(
     venda_id: int,
     webhook_message_id: Optional[str] = None
 ):
-    with get_conn(RECEBIMENTOS_DB_PATH) as conn:
-        conn.execute("""
-            INSERT OR REPLACE INTO recebimento_enviados (
+    """Marca a venda como enviada no PostgreSQL, com upsert real."""
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO recebimento_enviados (
+                    venda_id,
+                    enviado_em,
+                    webhook_message_id
+                )
+                VALUES (%s, %s, %s)
+                ON CONFLICT (venda_id) DO UPDATE SET
+                    enviado_em = EXCLUDED.enviado_em,
+                    webhook_message_id = EXCLUDED.webhook_message_id
+            """, (
                 venda_id,
-                enviado_em,
+                now_iso(),
                 webhook_message_id
-            )
-            VALUES (?, ?, ?)
-        """, (
-            venda_id,
-            now_iso(),
-            webhook_message_id
-        ))
+            ))
+        conn.commit()
+
+
+def limpar_reservas_antigas():
+    """Remove reservas antigas para não travar venda se o bot cair durante o envio."""
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                DELETE FROM recebimento_enviados
+                WHERE webhook_message_id LIKE 'reservado_%'
+                  AND enviado_em::timestamptz < NOW() - INTERVAL '10 minutes'
+            """)
+        conn.commit()
+
+
+def reservar_venda_para_envio(venda_id: int) -> Optional[str]:
+    """
+    Reserva a venda antes de enviar o webhook.
+
+    A reserva usa ON CONFLICT DO NOTHING nativo do PostgreSQL.
+    Se outra instância já reservou/enviou, não retorna token e não envia de novo.
+    """
+    token = f"reservado_{uuid4()}"
+
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO recebimento_enviados (
+                    venda_id,
+                    enviado_em,
+                    webhook_message_id
+                )
+                VALUES (%s, %s, %s)
+                ON CONFLICT (venda_id) DO NOTHING
+                RETURNING venda_id
+            """, (
+                venda_id,
+                now_iso(),
+                token
+            ))
+
+            row = cur.fetchone()
+
+        conn.commit()
+
+    if row:
+        return token
+
+    return None
+
+
+def confirmar_venda_enviada(
+    venda_id: int,
+    token_reserva: str,
+    webhook_message_id: Optional[str] = None
+):
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE recebimento_enviados
+                SET enviado_em = %s,
+                    webhook_message_id = %s
+                WHERE venda_id = %s
+                  AND webhook_message_id = %s
+            """, (
+                now_iso(),
+                webhook_message_id,
+                venda_id,
+                token_reserva
+            ))
+
+            if cur.rowcount == 0:
+                print(f"[RECEBIMENTO] Aviso: reserva da venda #{venda_id} não foi confirmada.")
+
+        conn.commit()
+
+
+def liberar_reserva_venda(venda_id: int, token_reserva: str):
+    """Remove a reserva se o webhook falhar, permitindo nova tentativa depois."""
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                DELETE FROM recebimento_enviados
+                WHERE venda_id = %s
+                  AND webhook_message_id = %s
+            """, (venda_id, token_reserva))
         conn.commit()
 
 
 def marcar_vendas_antigas_como_ignoradas(guild_id: int) -> int:
-    if not VENDAS_DB_PATH.exists():
-        return 0
-
     try:
         with get_conn(VENDAS_DB_PATH) as conn:
             vendas = conn.execute("""
@@ -185,10 +292,9 @@ def marcar_vendas_antigas_como_ignoradas(guild_id: int) -> int:
 
 
 def buscar_vendas_pendentes(guild_id: int):
-    if not VENDAS_DB_PATH.exists():
-        return []
-
     try:
+        limpar_reservas_antigas()
+
         with get_conn(VENDAS_DB_PATH) as conn:
             rows = conn.execute("""
                 SELECT *
@@ -214,9 +320,6 @@ def buscar_vendas_pendentes(guild_id: int):
 
 
 def buscar_venda_por_id(venda_id: int):
-    if not VENDAS_DB_PATH.exists():
-        return None
-
     try:
         with get_conn(VENDAS_DB_PATH) as conn:
             return conn.execute("""
@@ -231,9 +334,6 @@ def buscar_venda_por_id(venda_id: int):
 
 
 def buscar_itens_venda(venda_id: int):
-    if not VENDAS_DB_PATH.exists():
-        return []
-
     try:
         with get_conn(VENDAS_DB_PATH) as conn:
             return conn.execute("""
@@ -698,6 +798,7 @@ class Recebimentos(commands.Cog):
         try:
             mensagem = await enviar_webhook(config["webhook_url"], embed)
             marcar_venda_enviada(venda_id, str(mensagem.id))
+            print(f"[RECEBIMENTO] Venda #{venda_id} reenviada e marcada como enviada.")
 
             await interaction.followup.send(
                 f"Venda #{venda_id} reenviada com sucesso.",
@@ -729,7 +830,15 @@ class Recebimentos(commands.Cog):
             vendas = buscar_vendas_pendentes(guild.id)
 
             for venda in vendas:
-                itens = buscar_itens_venda(venda["id"])
+                venda_id = venda["id"]
+
+                token_reserva = reservar_venda_para_envio(venda_id)
+
+                if not token_reserva:
+                    # Outra instância/loop já reservou ou enviou esta venda.
+                    continue
+
+                itens = buscar_itens_venda(venda_id)
                 embed = montar_embed_recebimento(venda, itens)
 
                 try:
@@ -738,15 +847,17 @@ class Recebimentos(commands.Cog):
                         embed=embed
                     )
 
-                    marcar_venda_enviada(
-                        venda_id=venda["id"],
+                    confirmar_venda_enviada(
+                        venda_id=venda_id,
+                        token_reserva=token_reserva,
                         webhook_message_id=str(mensagem.id)
                     )
 
-                    print(f"[RECEBIMENTO] Venda #{venda['id']} enviada pelo webhook.")
+                    print(f"[RECEBIMENTO] Venda #{venda_id} enviada pelo webhook.")
 
                 except Exception as error:
-                    print(f"[RECEBIMENTO] Erro ao enviar venda #{venda['id']}: {error}")
+                    liberar_reserva_venda(venda_id, token_reserva)
+                    print(f"[RECEBIMENTO] Erro ao enviar venda #{venda_id}: {error}")
 
     @verificar_recebimentos.before_loop
     async def before_verificar_recebimentos(self):
